@@ -28,6 +28,12 @@ execute_process(
     COMMAND ./scripts/generateVersion.sh
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
+# YC-HACKING BEGIN
+# add hyprlang, so clangd can analyze it
+add_subdirectory("subprojects/hyprlang")
+include_directories("subprojects/hyprlang/include")
+# YC-HACKING END
+
 # udis
 add_subdirectory("subprojects/udis86")
 

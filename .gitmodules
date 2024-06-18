@@ -11,3 +11,6 @@
 	path = subprojects/wlroots-hyprland
 	url = https://github.com/hyprwm/wlroots-hyprland
 	ignore = dirty
+[submodule "subprojects/hyprlang"]
+	path = subprojects/hyprlang
+	url = git@github.com:hyprwm/hyprlang.git
