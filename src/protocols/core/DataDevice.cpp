@@ -82,9 +82,18 @@ void CWLDataOfferResource::sendData() {
     if (!source)
         return;
 
-    if (resource->version() >= 3) {
-        resource->sendSourceActions(7);
-        resource->sendAction(WL_DATA_DEVICE_MANAGER_DND_ACTION_MOVE);
+    const auto SOURCEACTIONS = source->actions();
+
+    if (resource->version() >= 3 && SOURCEACTIONS > 0) {
+        resource->sendSourceActions(SOURCEACTIONS);
+        if (SOURCEACTIONS & WL_DATA_DEVICE_MANAGER_DND_ACTION_MOVE)
+            resource->sendAction(WL_DATA_DEVICE_MANAGER_DND_ACTION_MOVE);
+        else if (SOURCEACTIONS & WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY)
+            resource->sendAction(WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY);
+        else {
+            LOGM(ERR, "Client bug? dnd source has no action move or copy. Sending move, f this.");
+            resource->sendAction(WL_DATA_DEVICE_MANAGER_DND_ACTION_MOVE);
+        }
     }
 
     for (auto const& m : source->mimes()) {
@@ -113,7 +122,7 @@ CWLDataSourceResource::CWLDataSourceResource(SP<CWlDataSource> resource_, SP<CWL
     resource->setOffer([this](CWlDataSource* r, const char* mime) { mimeTypes.push_back(mime); });
     resource->setSetActions([this](CWlDataSource* r, uint32_t a) {
         LOGM(LOG, "DataSource {:x} actions {}", (uintptr_t)this, a);
-        actions = (wl_data_device_manager_dnd_action)a;
+        supportedActions = a;
     });
 }
 
@@ -193,6 +202,10 @@ void CWLDataSourceResource::sendDndAction(wl_data_device_manager_dnd_action a) {
     if (resource->version() < 3)
         return;
     resource->sendAction(a);
+}
+
+uint32_t CWLDataSourceResource::actions() {
+    return supportedActions;
 }
 
 CWLDataDeviceResource::CWLDataDeviceResource(SP<CWlDataDevice> resource_) : resource(resource_) {
@@ -513,7 +526,10 @@ void CWLDataDeviceProtocol::initiateDrag(WP<CWLDataSourceResource> currentSource
             if (!box.has_value())
                 return;
 
-            dnd.focusedDevice->sendMotion(0 /* this is a hack */, V - box->pos());
+            timespec timeNow;
+            clock_gettime(CLOCK_MONOTONIC, &timeNow);
+
+            dnd.focusedDevice->sendMotion(timeNow.tv_sec * 1000 + timeNow.tv_nsec / 1000000, V - box->pos());
             LOGM(LOG, "Drag motion {}", V - box->pos());
         }
     });

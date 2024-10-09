@@ -23,11 +23,13 @@
 #include "protocols/PointerConstraints.hpp"
 #include "protocols/LayerShell.hpp"
 #include "protocols/XDGShell.hpp"
+#include "protocols/XDGOutput.hpp"
 #include "protocols/core/Compositor.hpp"
 #include "protocols/core/Subcompositor.hpp"
 #include "desktop/LayerSurface.hpp"
 #include "render/Renderer.hpp"
 #include "xwayland/XWayland.hpp"
+#include "helpers/ByteOperations.hpp"
 
 #include <hyprutils/string/String.hpp>
 #include <aquamarine/input/Input.hpp>
@@ -228,6 +230,9 @@ void CCompositor::initServer(std::string socketName, int socketFd) {
 
     if (envEnabled("HYPRLAND_TRACE"))
         Debug::trace = true;
+
+    // set the buffer size to 1MB to avoid disconnects due to an app hanging for a short while
+    wl_display_set_default_max_buffer_size(m_sWLDisplay, 1_MB);
 
     Aquamarine::SBackendOptions options;
     options.logFunction = aqLog;
@@ -2696,7 +2701,17 @@ WORKSPACEID CCompositor::getNewSpecialID() {
 }
 
 void CCompositor::performUserChecks() {
-    ; // intentional
+    static auto PNOCHECKXDG = CConfigValue<Hyprlang::INT>("misc:disable_xdg_env_checks");
+
+    if (!*PNOCHECKXDG) {
+        const auto CURRENT_DESKTOP_ENV = getenv("XDG_CURRENT_DESKTOP");
+        if (!CURRENT_DESKTOP_ENV || std::string{CURRENT_DESKTOP_ENV} != "Hyprland") {
+            g_pHyprNotificationOverlay->addNotification(
+                std::format("Your XDG_CURRENT_DESKTOP environment seems to be managed externally, and the current value is {}.\nThis might cause issues unless it's intentional.",
+                            CURRENT_DESKTOP_ENV ? CURRENT_DESKTOP_ENV : "unset"),
+                CColor{}, 15000, ICON_WARNING);
+        }
+    }
 }
 
 void CCompositor::moveWindowToWorkspaceSafe(PHLWINDOW pWindow, PHLWORKSPACE pWorkspace) {
@@ -2855,6 +2870,8 @@ void CCompositor::arrangeMonitors() {
         else
             m->xwaylandScale = 1.f;
     }
+
+    PROTO::xdgOutput->updateAllOutputs();
 }
 
 void CCompositor::enterUnsafeState() {
@@ -2943,6 +2960,38 @@ PHLWINDOW CCompositor::windowForCPointer(CWindow* pWindow) {
     return {};
 }
 
+static void checkDefaultCursorWarp(SP<CMonitor> monitor) {
+    static auto PCURSORMONITOR    = CConfigValue<std::string>("cursor:default_monitor");
+    static bool cursorDefaultDone = false;
+    static bool firstLaunch       = true;
+
+    const auto  POS = monitor->middle();
+
+    // by default, cursor should be set to first monitor detected
+    // this is needed as a default if the monitor given in config above doesn't exist
+    if (firstLaunch) {
+        firstLaunch = false;
+        g_pCompositor->warpCursorTo(POS, true);
+        g_pInputManager->refocus();
+        return;
+    }
+
+    if (!cursorDefaultDone && *PCURSORMONITOR != STRVAL_EMPTY) {
+        if (*PCURSORMONITOR == monitor->szName) {
+            cursorDefaultDone = true;
+            g_pCompositor->warpCursorTo(POS, true);
+            g_pInputManager->refocus();
+            return;
+        }
+    }
+
+    // modechange happend check if cursor is on that monitor and warp it to middle to not place it out of bounds if resolution changed.
+    if (g_pCompositor->getMonitorFromCursor() == monitor.get()) {
+        g_pCompositor->warpCursorTo(POS, true);
+        g_pInputManager->refocus();
+    }
+}
+
 void CCompositor::onNewMonitor(SP<Aquamarine::IOutput> output) {
     // add it to real
     auto PNEWMONITOR = g_pCompositor->m_vRealMonitors.emplace_back(makeShared<CMonitor>(output));
@@ -2976,6 +3025,8 @@ void CCompositor::onNewMonitor(SP<Aquamarine::IOutput> output) {
 
     g_pConfigManager->m_bWantsMonitorReload = true;
     g_pCompositor->scheduleFrameForMonitor(PNEWMONITOR.get(), IOutput::AQ_SCHEDULE_NEW_MONITOR);
+
+    checkDefaultCursorWarp(PNEWMONITOR);
 
     for (auto const& w : g_pCompositor->m_vWindows) {
         if (w->m_iMonitorID == PNEWMONITOR->ID) {

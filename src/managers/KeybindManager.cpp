@@ -594,6 +594,10 @@ eMultiKeyCase CKeybindManager::mkBindMatches(const SKeybind keybind) {
     return mkKeysymSetMatches(keybind.sMkKeys, m_sMkKeys);
 }
 
+std::string CKeybindManager::getCurrentSubmap() {
+    return m_szCurrentSelectedSubmap;
+}
+
 SDispatchResult CKeybindManager::handleKeybinds(const uint32_t modmask, const SPressedKeyWithMods& key, bool pressed) {
     static auto     PDISABLEINHIBIT = CConfigValue<Hyprlang::INT>("binds:disable_keybind_grabbing");
     bool            found           = false;
@@ -1939,7 +1943,7 @@ SDispatchResult CKeybindManager::forceRendererReload(std::string args) {
         if (!m->output)
             continue;
 
-        auto rule = g_pConfigManager->getMonitorRuleFor(*m);
+        auto rule = g_pConfigManager->getMonitorRuleFor(m);
         if (!g_pHyprRenderer->applyMonitorRule(m.get(), &rule, true)) {
             overAgain = true;
             break;
@@ -2399,9 +2403,7 @@ SDispatchResult CKeybindManager::dpms(std::string arg) {
     bool            enable = arg.starts_with("on");
     std::string     port   = "";
 
-    if (arg.starts_with("toggle"))
-        enable = !std::any_of(g_pCompositor->m_vMonitors.begin(), g_pCompositor->m_vMonitors.end(), [&](const auto& other) { return !other->dpmsStatus; }); // enable if any is off
-
+    bool            isToggle = arg.starts_with("toggle");
     if (arg.find_first_of(' ') != std::string::npos)
         port = arg.substr(arg.find_first_of(' ') + 1);
 
@@ -2409,6 +2411,9 @@ SDispatchResult CKeybindManager::dpms(std::string arg) {
 
         if (!port.empty() && m->szName != port)
             continue;
+
+        if (isToggle)
+            enable = !m->dpmsStatus;
 
         m->output->state->resetExplicitFences();
         m->output->state->setEnabled(enable);
@@ -2730,7 +2735,7 @@ SDispatchResult CKeybindManager::moveIntoGroup(std::string args) {
 
     const auto PWINDOW = g_pCompositor->m_pLastWindow.lock();
 
-    if (!PWINDOW || PWINDOW->m_bIsFloating || PWINDOW->m_sGroupData.deny)
+    if (!PWINDOW || PWINDOW->m_sGroupData.deny)
         return {};
 
     auto PWINDOWINDIR = g_pCompositor->getWindowInDirection(PWINDOW, arg);

@@ -22,6 +22,12 @@
       inputs.hyprlang.follows = "hyprlang";
     };
 
+    hyprland-protocols = {
+      url = "github:hyprwm/hyprland-protocols";
+      inputs.nixpkgs.follows = "nixpkgs";
+      inputs.systems.follows = "systems";
+    };
+
     hyprlang = {
       url = "github:hyprwm/hyprlang";
       inputs.nixpkgs.follows = "nixpkgs";
@@ -46,6 +52,8 @@
       inputs.nixpkgs.follows = "nixpkgs";
       inputs.systems.follows = "systems";
       inputs.hyprlang.follows = "hyprlang";
+      inputs.hyprutils.follows = "hyprutils";
+      inputs.hyprwayland-scanner.follows = "hyprwayland-scanner";
     };
   };
 
@@ -60,6 +68,15 @@
     pkgsFor = eachSystem (system:
       import nixpkgs {
         localSystem = system;
+        overlays = with self.overlays; [
+          hyprland-packages
+          hyprland-extras
+        ];
+      });
+    pkgsCrossFor = eachSystem (system: crossSystem:
+      import nixpkgs {
+        localSystem = system;
+        crossSystem = crossSystem;
         overlays = with self.overlays; [
           hyprland-packages
           hyprland-extras
@@ -90,18 +107,15 @@
         
         xdg-desktop-portal-hyprland
         ;
+      hyprland-cross = (pkgsCrossFor.${system} "aarch64-linux").hyprland;
     });
 
     devShells = eachSystem (system: {
       default =
         pkgsFor.${system}.mkShell.override {
-          stdenv = pkgsFor.${system}.gcc14Stdenv;
+          inherit (self.packages.${system}.default) stdenv;
         } {
           name = "hyprland-shell";
-          nativeBuildInputs = with pkgsFor.${system}; [
-            expat
-            libxml2
-          ];
           hardeningDisable = ["fortify"];
           inputsFrom = [pkgsFor.${system}.hyprland];
           packages = [pkgsFor.${system}.clang-tools];

@@ -1,20 +1,21 @@
 {
   lib,
   stdenv,
+  stdenvAdapters,
   pkg-config,
   pkgconf,
   makeWrapper,
-  cmake,
+  meson,
   ninja,
   aquamarine,
   binutils,
   cairo,
   git,
   hyprcursor,
+  hyprland-protocols,
   hyprlang,
   hyprutils,
   hyprwayland-scanner,
-  jq,
   libGL,
   libdrm,
   libexecinfo,
@@ -24,9 +25,9 @@
   mesa,
   pango,
   pciutils,
-  python3,
   systemd,
   tomlplusplus,
+  udis86-hyprland,
   wayland,
   wayland-protocols,
   wayland-scanner,
@@ -45,133 +46,140 @@
   enableNvidiaPatches ? false,
   nvidiaPatches ? false,
   hidpiXWayland ? false,
-}:
-assert lib.assertMsg (!nvidiaPatches) "The option `nvidiaPatches` has been removed.";
-assert lib.assertMsg (!enableNvidiaPatches) "The option `enableNvidiaPatches` has been removed.";
-assert lib.assertMsg (!hidpiXWayland) "The option `hidpiXWayland` has been removed. Please refer https://wiki.hyprland.org/Configuring/XWayland";
-  stdenv.mkDerivation {
-    pname = "hyprland${lib.optionalString debug "-debug"}";
-    inherit version;
+}: let
+  inherit (builtins) baseNameOf foldl';
+  inherit (lib.asserts) assertMsg;
+  inherit (lib.attrsets) mapAttrsToList;
+  inherit (lib.lists) flatten concatLists optional optionals;
+  inherit (lib.sources) cleanSourceWith cleanSource;
+  inherit (lib.strings) hasSuffix makeBinPath optionalString mesonBool mesonEnable;
 
-    src = lib.cleanSourceWith {
-      filter = name: type: let
-        baseName = baseNameOf (toString name);
-      in
-        ! (lib.hasSuffix ".nix" baseName);
-      src = lib.cleanSource ../.;
-    };
+  adapters = flatten [
+    stdenvAdapters.useMoldLinker
+  ];
 
-    patches = [
-      # forces GCC to use -std=c++26
-      ./stdcxx.patch
-    ];
+  customStdenv = foldl' (acc: adapter: adapter acc) stdenv adapters;
+in
+  assert assertMsg (!nvidiaPatches) "The option `nvidiaPatches` has been removed.";
+  assert assertMsg (!enableNvidiaPatches) "The option `enableNvidiaPatches` has been removed.";
+  assert assertMsg (!hidpiXWayland) "The option `hidpiXWayland` has been removed. Please refer https://wiki.hyprland.org/Configuring/XWayland";
+    customStdenv.mkDerivation {
+      pname = "hyprland${optionalString debug "-debug"}";
+      inherit version;
 
-    postPatch = ''
-      # Fix hardcoded paths to /usr installation
-      sed -i "s#/usr#$out#" src/render/OpenGL.cpp
+      src = cleanSourceWith {
+        filter = name: type: let
+          baseName = baseNameOf (toString name);
+        in
+          ! (hasSuffix ".nix" baseName);
+        src = cleanSource ../.;
+      };
 
-      # Remove extra @PREFIX@ to fix pkg-config paths
-      sed -i "s#@PREFIX@/##g" hyprland.pc.in
-    '';
+      postPatch = ''
+        # Fix hardcoded paths to /usr installation
+        sed -i "s#/usr#$out#" src/render/OpenGL.cpp
 
-    COMMITS = revCount;
-    DATE = date;
-    DIRTY = lib.optionalString (commit == "") "dirty";
-    HASH = commit;
+        # Remove extra @PREFIX@ to fix pkg-config paths
+        sed -i "s#@PREFIX@/##g" hyprland.pc.in
+      '';
 
-    depsBuildBuild = [
-      pkg-config
-    ];
+      COMMITS = revCount;
+      DATE = date;
+      DIRTY = optionalString (commit == "") "dirty";
+      HASH = commit;
 
-    nativeBuildInputs = [
-      hyprwayland-scanner
-      jq
-      makeWrapper
-      cmake
-      ninja
-      pkg-config
-      python3 # for udis86
-      wayland-scanner
-    ];
+      depsBuildBuild = [
+        pkg-config
+      ];
 
-    outputs = [
-      "out"
-      "man"
-      "dev"
-    ];
+      nativeBuildInputs = [
+        hyprwayland-scanner
+        makeWrapper
+        meson
+        ninja
+        pkg-config
+      ];
 
-    buildInputs = lib.concatLists [
-      [
-        aquamarine
-        cairo
-        # expat
-        # fribidi
-        git
-        hyprcursor
-        hyprlang
-        hyprutils
-        # libdatrie
-        libdrm
-        libGL
-        libinput
-        # libselinux
-        # libsepol
-        # libthai
-        libuuid
-        libxkbcommon
-        mesa
-        pango
-        pciutils
-        # pcre2
-        tomlplusplus
-        wayland
-        wayland-protocols
-        xorg.libXcursor
-      ]
-      (lib.optionals stdenv.hostPlatform.isMusl [libexecinfo])
-      (lib.optionals enableXWayland [
-        xorg.libxcb
-        xorg.libXdmcp
-        xorg.xcbutilerrors
-        xorg.xcbutilrenderutil
-        xorg.xcbutilwm
-        xwayland
-      ])
-      (lib.optionals withSystemd [systemd])
-    ];
+      outputs = [
+        "out"
+        "man"
+        "dev"
+      ];
 
-    cmakeBuildType =
-      if debug
-      then "Debug"
-      else "RelWithDebInfo";
-
-    # we want as much debug info as possible
-    dontStrip = debug;
-
-    cmakeFlags = [
-      (lib.cmakeBool "NO_XWAYLAND" (!enableXWayland))
-      (lib.cmakeBool "LEGACY_RENDERER" legacyRenderer)
-      (lib.cmakeBool "NO_SYSTEMD" (!withSystemd))
-    ];
-
-    postInstall = ''
-      ${lib.optionalString wrapRuntimeDeps ''
-        wrapProgram $out/bin/Hyprland \
-          --suffix PATH : ${lib.makeBinPath [
-          binutils
+      buildInputs = concatLists [
+        [
+          aquamarine
+          cairo
+          git
+          hyprcursor
+          hyprland-protocols
+          hyprlang
+          hyprutils
+          libdrm
+          libGL
+          libinput
+          libuuid
+          libxkbcommon
+          mesa
+          pango
           pciutils
-          pkgconf
-        ]}
-      ''}
-    '';
+          tomlplusplus
+          udis86-hyprland
+          wayland
+          wayland-protocols
+          wayland-scanner
+          xorg.libXcursor
+        ]
+        (optionals customStdenv.hostPlatform.isMusl [libexecinfo])
+        (optionals enableXWayland [
+          xorg.libxcb
+          xorg.libXdmcp
+          xorg.xcbutilerrors
+          xorg.xcbutilrenderutil
+          xorg.xcbutilwm
+          xwayland
+        ])
+        (optional withSystemd systemd)
+      ];
 
-    passthru.providedSessions = ["hyprland"];
+      mesonBuildType =
+        if debug
+        then "debugoptimized"
+        else "release";
 
-    meta = {
-      homepage = "https://github.com/hyprwm/Hyprland";
-      description = "Dynamic tiling Wayland compositor that doesn't sacrifice on its looks";
-      license = lib.licenses.bsd3;
-      platforms = lib.platforms.linux;
-      mainProgram = "Hyprland";
-    };
-  }
+      # we want as much debug info as possible
+      dontStrip = debug;
+
+      mesonFlags = flatten [
+        (mapAttrsToList mesonEnable {
+          "xwayland" = enableXWayland;
+          "legacy_renderer" = legacyRenderer;
+          "systemd" = withSystemd;
+        })
+        (mapAttrsToList mesonBool {
+          "b_pch" = false;
+          "tracy_enable" = false;
+        })
+      ];
+
+      postInstall = ''
+        ${optionalString wrapRuntimeDeps ''
+          wrapProgram $out/bin/Hyprland \
+            --suffix PATH : ${makeBinPath [
+            binutils
+            pciutils
+            pkgconf
+          ]}
+        ''}
+      '';
+
+      passthru.providedSessions = ["hyprland"];
+
+      meta = {
+        homepage = "https://github.com/hyprwm/Hyprland";
+        description = "Dynamic tiling Wayland compositor that doesn't sacrifice on its looks";
+        license = lib.licenses.bsd3;
+        platforms = lib.platforms.linux;
+        mainProgram = "Hyprland";
+      };
+    }

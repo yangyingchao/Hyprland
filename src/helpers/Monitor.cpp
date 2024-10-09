@@ -2,7 +2,6 @@
 #include "MiscFunctions.hpp"
 #include "math/Math.hpp"
 #include "sync/SyncReleaser.hpp"
-#include "ScopeGuard.hpp"
 #include "../Compositor.hpp"
 #include "../config/ConfigValue.hpp"
 #include "../protocols/GammaControl.hpp"
@@ -13,11 +12,14 @@
 #include "../protocols/DRMSyncobj.hpp"
 #include "../protocols/core/Output.hpp"
 #include "../managers/PointerManager.hpp"
+#include "../managers/eventLoop/EventLoopManager.hpp"
 #include "../protocols/core/Compositor.hpp"
 #include "sync/SyncTimeline.hpp"
 #include <aquamarine/output/Output.hpp>
 #include <hyprutils/string/String.hpp>
+#include <hyprutils/utils/ScopeGuard.hpp>
 using namespace Hyprutils::String;
+using namespace Hyprutils::Utils;
 
 int ratHandler(void* data) {
     g_pHyprRenderer->renderMonitor((CMonitor*)data);
@@ -34,6 +36,7 @@ CMonitor::~CMonitor() {
 }
 
 void CMonitor::onConnect(bool noRule) {
+    CScopeGuard x = {[]() { g_pCompositor->arrangeMonitors(); }};
 
     if (output->supportsExplicit) {
         inTimeline  = CSyncTimeline::create(output->getBackend()->drmFD());
@@ -113,7 +116,7 @@ void CMonitor::onConnect(bool noRule) {
         createdByUser = true; // should be true. WL and Headless backends should be addable / removable
 
     // get monitor rule that matches
-    SMonitorRule monitorRule = g_pConfigManager->getMonitorRuleFor(*this);
+    SMonitorRule monitorRule = g_pConfigManager->getMonitorRuleFor(self.lock());
 
     // if it's disabled, disable and ignore
     if (monitorRule.disabled) {
@@ -192,10 +195,6 @@ void CMonitor::onConnect(bool noRule) {
     if (!activeMonitorRule.mirrorOf.empty())
         setMirror(activeMonitorRule.mirrorOf);
 
-    g_pEventManager->postEvent(SHyprIPCEvent{"monitoradded", szName});
-    g_pEventManager->postEvent(SHyprIPCEvent{"monitoraddedv2", std::format("{},{},{}", ID, szName, szShortDescription)});
-    EMIT_HOOK_EVENT("monitorAdded", this);
-
     if (!g_pCompositor->m_pLastMonitor) // set the last monitor if it isnt set yet
         g_pCompositor->setActiveMonitor(this);
 
@@ -224,9 +223,20 @@ void CMonitor::onConnect(bool noRule) {
     PROTO::gamma->applyGammaToState(this);
 
     events.connect.emit();
+
+    g_pEventManager->postEvent(SHyprIPCEvent{"monitoradded", szName});
+    g_pEventManager->postEvent(SHyprIPCEvent{"monitoraddedv2", std::format("{},{},{}", ID, szName, szShortDescription)});
+    EMIT_HOOK_EVENT("monitorAdded", this);
 }
 
 void CMonitor::onDisconnect(bool destroy) {
+    CScopeGuard x = {[this]() {
+        if (g_pCompositor->m_bIsShuttingDown)
+            return;
+        g_pEventManager->postEvent(SHyprIPCEvent{"monitorremoved", szName});
+        EMIT_HOOK_EVENT("monitorRemoved", this);
+        g_pCompositor->arrangeMonitors();
+    }};
 
     if (renderTimer) {
         wl_event_source_remove(renderTimer);
@@ -280,9 +290,6 @@ void CMonitor::onDisconnect(bool destroy) {
     }
 
     Debug::log(LOG, "Removed monitor {}!", szName);
-
-    g_pEventManager->postEvent(SHyprIPCEvent{"monitorremoved", szName});
-    EMIT_HOOK_EVENT("monitorRemoved", this);
 
     if (!BACKUPMON) {
         Debug::log(WARN, "Unplugged last monitor, entering an unsafe state. Good luck my friend.");
@@ -488,7 +495,7 @@ void CMonitor::setMirror(const std::string& mirrorOf) {
         pMirrorOf = nullptr;
 
         // set rule
-        const auto RULE = g_pConfigManager->getMonitorRuleFor(*this);
+        const auto RULE = g_pConfigManager->getMonitorRuleFor(self.lock());
 
         vecPosition = RULE.offset;
 
@@ -771,12 +778,9 @@ Vector2D CMonitor::middle() {
 }
 
 void CMonitor::updateMatrix() {
-    matrixIdentity(projMatrix.data());
-    if (transform != WL_OUTPUT_TRANSFORM_NORMAL) {
-        matrixTranslate(projMatrix.data(), vecPixelSize.x / 2.0, vecPixelSize.y / 2.0);
-        matrixTransform(projMatrix.data(), wlTransformToHyprutils(transform));
-        matrixTranslate(projMatrix.data(), -vecTransformedSize.x / 2.0, -vecTransformedSize.y / 2.0);
-    }
+    projMatrix = Mat3x3::identity();
+    if (transform != WL_OUTPUT_TRANSFORM_NORMAL)
+        projMatrix.translate(vecPixelSize / 2.0).transform(wlTransformToHyprutils(transform)).translate(-vecTransformedSize / 2.0);
 }
 
 WORKSPACEID CMonitor::activeWorkspaceID() {
@@ -791,20 +795,22 @@ CBox CMonitor::logicalBox() {
     return {vecPosition, vecSize};
 }
 
-static void onDoneSource(void* data) {
-    auto pMonitor = (CMonitor*)data;
-
-    if (!PROTO::outputs.contains(pMonitor->szName))
-        return;
-
-    PROTO::outputs.at(pMonitor->szName)->sendDone();
-}
-
 void CMonitor::scheduleDone() {
-    if (doneSource)
+    if (doneScheduled)
         return;
 
-    doneSource = wl_event_loop_add_idle(g_pCompositor->m_sWLEventLoop, ::onDoneSource, this);
+    doneScheduled = true;
+
+    g_pEventLoopManager->doLater([M = self] {
+        if (!M) // if M is gone, we got destroyed, doesn't matter.
+            return;
+
+        if (!PROTO::outputs.contains(M->szName))
+            return;
+
+        PROTO::outputs.at(M->szName)->sendDone();
+        M->doneScheduled = false;
+    });
 }
 
 bool CMonitor::attemptDirectScanout() {

@@ -17,16 +17,8 @@ CPointerManager::CPointerManager() {
 
         onMonitorLayoutChange();
 
-        PMONITOR->events.modeChanged.registerStaticListener(
-            [this, PMONITOR](void* owner, std::any data) {
-                g_pEventLoopManager->doLater([this, PMONITOR]() {
-                    onMonitorLayoutChange();
-                    checkDefaultCursorWarp(PMONITOR, PMONITOR->output->name);
-                });
-            },
-            nullptr);
-        PMONITOR->events.disconnect.registerStaticListener(
-            [this, PMONITOR](void* owner, std::any data) { g_pEventLoopManager->doLater([this, PMONITOR]() { onMonitorLayoutChange(); }); }, nullptr);
+        PMONITOR->events.modeChanged.registerStaticListener([this](void* owner, std::any data) { g_pEventLoopManager->doLater([this]() { onMonitorLayoutChange(); }); }, nullptr);
+        PMONITOR->events.disconnect.registerStaticListener([this](void* owner, std::any data) { g_pEventLoopManager->doLater([this]() { onMonitorLayoutChange(); }); }, nullptr);
         PMONITOR->events.destroy.registerStaticListener(
             [this](void* owner, std::any data) {
                 if (g_pCompositor && !g_pCompositor->m_bIsShuttingDown)
@@ -42,38 +34,6 @@ CPointerManager::CPointerManager() {
 
         state->cursorRendered = false;
     });
-}
-
-void CPointerManager::checkDefaultCursorWarp(SP<CMonitor> monitor, std::string monitorName) {
-    static auto PCURSORMONITOR    = CConfigValue<std::string>("cursor:default_monitor");
-    static bool cursorDefaultDone = false;
-    static bool firstLaunch       = true;
-
-    const auto  POS = monitor->middle();
-
-    // by default, cursor should be set to first monitor detected
-    // this is needed as a default if the monitor given in config above doesn't exist
-    if (firstLaunch) {
-        firstLaunch = false;
-        g_pCompositor->warpCursorTo(POS, true);
-        g_pInputManager->refocus();
-        return;
-    }
-
-    if (!cursorDefaultDone && *PCURSORMONITOR != STRVAL_EMPTY) {
-        if (*PCURSORMONITOR == monitorName) {
-            cursorDefaultDone = true;
-            g_pCompositor->warpCursorTo(POS, true);
-            g_pInputManager->refocus();
-            return;
-        }
-    }
-
-    // modechange happend check if cursor is on that monitor and warp it to middle to not place it out of bounds if resolution changed.
-    if (g_pCompositor->getMonitorFromCursor() == monitor.get()) {
-        g_pCompositor->warpCursorTo(POS, true);
-        g_pInputManager->refocus();
-    }
 }
 
 void CPointerManager::lockSoftwareAll() {
@@ -246,9 +206,8 @@ void CPointerManager::recheckEnteredOutputs() {
 
             // if we are using hw cursors, prevent
             // the cursor from being stuck at the last point.
-            // if we are leaving it, move it to narnia.
             if (!s->hardwareFailed && (s->monitor->output->getBackend()->capabilities() & Aquamarine::IBackendImplementation::eBackendCapabilities::AQ_BACKEND_CAPABILITY_POINTER))
-                s->monitor->output->moveCursor({-1337, -420});
+                setHWCursorBuffer(s, nullptr);
 
             if (!currentCursorImage.surface)
                 continue;
@@ -307,11 +266,22 @@ void CPointerManager::resetCursorImage(bool apply) {
 void CPointerManager::updateCursorBackend() {
     static auto PNOHW = CConfigValue<Hyprlang::INT>("cursor:no_hardware_cursors");
 
+    const auto  CURSORBOX = getCursorBoxGlobal();
+
     for (auto const& m : g_pCompositor->m_vMonitors) {
         auto state = stateFor(m);
 
         if (!m->m_bEnabled || !m->dpmsStatus) {
             Debug::log(TRACE, "Not updating hw cursors: disabled / dpms off display");
+            continue;
+        }
+
+        auto CROSSES = !m->logicalBox().intersection(CURSORBOX).empty();
+
+        if (!CROSSES) {
+            if (state->cursorFrontBuffer)
+                setHWCursorBuffer(state, nullptr);
+
             continue;
         }
 
@@ -335,10 +305,24 @@ void CPointerManager::onCursorMoved() {
     if (!hasCursor())
         return;
 
+    const auto CURSORBOX = getCursorBoxGlobal();
+    bool       recalc    = false;
+
     for (auto const& m : g_pCompositor->m_vMonitors) {
         auto state = stateFor(m);
 
         state->box = getCursorBoxLogicalForMonitor(state->monitor.lock());
+
+        auto CROSSES = !m->logicalBox().intersection(CURSORBOX).empty();
+
+        if (!CROSSES && state->cursorFrontBuffer) {
+            Debug::log(TRACE, "onCursorMoved for output {}: cursor left the viewport, removing it from the backend", m->szName);
+            setHWCursorBuffer(state, nullptr);
+            continue;
+        } else if (CROSSES && !state->cursorFrontBuffer) {
+            Debug::log(TRACE, "onCursorMoved for output {}: cursor entered the output, but no front buffer, forcing recalc", m->szName);
+            recalc = true;
+        }
 
         if (state->hardwareFailed || !state->entered)
             continue;
@@ -346,6 +330,9 @@ void CPointerManager::onCursorMoved() {
         const auto CURSORPOS = getCursorPosForMonitor(m);
         m->output->moveCursor(CURSORPOS);
     }
+
+    if (recalc)
+        updateCursorBackend();
 }
 
 bool CPointerManager::attemptHardwareCursor(SP<CPointerManager::SMonitorPointerState> state) {
@@ -675,7 +662,7 @@ void CPointerManager::damageIfSoftware() {
     static auto PNOHW = CConfigValue<Hyprlang::INT>("cursor:no_hardware_cursors");
 
     for (auto const& mw : monitorStates) {
-        if (mw->monitor.expired())
+        if (mw->monitor.expired() || !mw->monitor->output)
             continue;
 
         if ((mw->softwareLocks > 0 || mw->hardwareFailed || *PNOHW) && b.overlaps({mw->monitor->vecPosition, mw->monitor->vecSize})) {
@@ -789,7 +776,7 @@ void CPointerManager::warpAbsolute(Vector2D abs, SP<IHID> dev) {
 void CPointerManager::onMonitorLayoutChange() {
     currentMonitorLayout.monitorBoxes.clear();
     for (auto const& m : g_pCompositor->m_vMonitors) {
-        if (m->isMirror() || !m->m_bEnabled)
+        if (m->isMirror() || !m->m_bEnabled || !m->output)
             continue;
 
         currentMonitorLayout.monitorBoxes.emplace_back(CBox{m->vecPosition, m->vecSize});
@@ -821,6 +808,9 @@ void CPointerManager::attachPointer(SP<IPointer> pointer) {
     if (!pointer)
         return;
 
+    static auto PMOUSEDPMS = CConfigValue<Hyprlang::INT>("misc:mouse_move_enables_dpms");
+
+    //
     auto listener = pointerListeners.emplace_back(makeShared<SPointerListener>());
 
     listener->pointer = pointer;
@@ -836,6 +826,9 @@ void CPointerManager::attachPointer(SP<IPointer> pointer) {
         g_pInputManager->onMouseMoved(E);
 
         PROTO::idle->onActivity();
+
+        if (!g_pCompositor->m_bDPMSStateON && *PMOUSEDPMS)
+            g_pKeybindManager->dpms("on");
     });
 
     listener->motionAbsolute = pointer->pointerEvents.motionAbsolute.registerListener([this] (std::any e) {
@@ -844,6 +837,9 @@ void CPointerManager::attachPointer(SP<IPointer> pointer) {
         g_pInputManager->onMouseWarp(E);
 
         PROTO::idle->onActivity();
+
+        if (!g_pCompositor->m_bDPMSStateON && *PMOUSEDPMS)
+            g_pKeybindManager->dpms("on");
     });
 
     listener->button = pointer->pointerEvents.button.registerListener([this] (std::any e) {
@@ -872,6 +868,9 @@ void CPointerManager::attachPointer(SP<IPointer> pointer) {
         g_pInputManager->onSwipeBegin(E);
 
         PROTO::idle->onActivity();
+
+        if (!g_pCompositor->m_bDPMSStateON && *PMOUSEDPMS)
+            g_pKeybindManager->dpms("on");
     });
 
     listener->swipeEnd = pointer->pointerEvents.swipeEnd.registerListener([this] (std::any e) {
@@ -896,6 +895,9 @@ void CPointerManager::attachPointer(SP<IPointer> pointer) {
         PROTO::pointerGestures->pinchBegin(E.timeMs, E.fingers);
 
         PROTO::idle->onActivity();
+
+        if (!g_pCompositor->m_bDPMSStateON && *PMOUSEDPMS)
+            g_pKeybindManager->dpms("on");
     });
 
     listener->pinchEnd = pointer->pointerEvents.pinchEnd.registerListener([this] (std::any e) {
@@ -938,6 +940,9 @@ void CPointerManager::attachTouch(SP<ITouch> touch) {
     if (!touch)
         return;
 
+    static auto PMOUSEDPMS = CConfigValue<Hyprlang::INT>("misc:mouse_move_enables_dpms");
+
+    //
     auto listener = touchListeners.emplace_back(makeShared<STouchListener>());
 
     listener->touch = touch;
@@ -953,6 +958,9 @@ void CPointerManager::attachTouch(SP<ITouch> touch) {
         g_pInputManager->onTouchDown(E);
 
         PROTO::idle->onActivity();
+
+        if (!g_pCompositor->m_bDPMSStateON && *PMOUSEDPMS)
+            g_pKeybindManager->dpms("on");
     });
 
     listener->up = touch->touchEvents.up.registerListener([this] (std::any e) {
@@ -987,6 +995,9 @@ void CPointerManager::attachTablet(SP<CTablet> tablet) {
     if (!tablet)
         return;
 
+    static auto PMOUSEDPMS = CConfigValue<Hyprlang::INT>("misc:mouse_move_enables_dpms");
+
+    //
     auto listener = tabletListeners.emplace_back(makeShared<STabletListener>());
 
     listener->tablet = tablet;
@@ -1002,6 +1013,9 @@ void CPointerManager::attachTablet(SP<CTablet> tablet) {
         g_pInputManager->onTabletAxis(E);
 
         PROTO::idle->onActivity();
+
+        if (!g_pCompositor->m_bDPMSStateON && *PMOUSEDPMS)
+            g_pKeybindManager->dpms("on");
     });
 
     listener->proximity = tablet->tabletEvents.proximity.registerListener([this] (std::any e) {
@@ -1018,6 +1032,9 @@ void CPointerManager::attachTablet(SP<CTablet> tablet) {
         g_pInputManager->onTabletTip(E);
 
         PROTO::idle->onActivity();
+
+        if (!g_pCompositor->m_bDPMSStateON && *PMOUSEDPMS)
+            g_pKeybindManager->dpms("on");
     });
 
     listener->button = tablet->tabletEvents.button.registerListener([this] (std::any e) {
